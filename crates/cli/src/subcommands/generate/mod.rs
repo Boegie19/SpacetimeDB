@@ -5,16 +5,23 @@ use std::io::Write;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
-use clap::Arg;
-use clap::ArgAction::SetTrue;
+use clap::{Arg, ArgAction, ArgGroup, ArgMatches};
 use convert_case::{Case, Casing};
 use duct::cmd;
-use spacetimedb_lib::sats::{AlgebraicType, Typespace};
+use serde::de::IntoDeserializer;
+use serde_json::Value;
+use spacetimedb_lib::de::serde::DeserializeWrapper;
+use spacetimedb::host::module_host::ModuleEvent;
+use spacetimedb_lib::sats::{satn, AlgebraicType, Typespace};
 use spacetimedb_lib::MODULE_ABI_MAJOR_VERSION;
-use spacetimedb_lib::{bsatn, MiscModuleExport, ModuleDef, ReducerDef, TableDesc, TypeAlias};
+use spacetimedb_lib::{bsatn, MiscModuleExport, ModuleDef, ReducerDef, TableDesc, TypeAlias, sats};
+use wasmbin::Module;
 use wasmtime::{AsContext, Caller};
 
+use crate::common_args;
 use crate::Config;
+use crate::api::ClientApi;
+use crate::sql::parse_req;
 
 mod code_indenter;
 pub mod csharp;
@@ -23,26 +30,33 @@ pub mod rust;
 pub mod typescript;
 mod util;
 
+
 const INDENT: &str = "\t";
 
 pub fn cli() -> clap::Command {
     clap::Command::new("generate")
         .about("Generate client files for a spacetime module.")
         .arg(
-            Arg::new("wasm_file")
-                .value_parser(clap::value_parser!(PathBuf))
-                .long("wasm-file")
-                .short('w')
-                .conflicts_with("project_path")
-                .help("The system path (absolute or relative) to the wasm file we should inspect"),
+            Arg::new("database")
+                .required(true)
+                .help("The domain or address of the database you would like to query"),
         )
         .arg(
-            Arg::new("project_path")
-                .value_parser(clap::value_parser!(PathBuf))
-                .default_value(".")
-                .long("project-path")
-                .short('p')
-                .help("The system path (absolute or relative) to the project you would like to inspect")
+            common_args::identity()
+                .conflicts_with("anon_identity")
+                .help("The identity to use for querying the database")
+                .long_help("The identity to use for querying the database. If no identity is provided, the default one will be used."),
+        )
+        .arg(
+            Arg::new("anon_identity")
+                .long("anon-identity")
+                .short('a')
+                .conflicts_with("identity")
+                .action(ArgAction::SetTrue)
+                .help("If this flag is present, no identity will be provided when querying the database")
+        )
+        .arg(common_args::server()
+                .help("The nickname, host name or URL of the server hosting the database"),
         )
         .arg(
             Arg::new("out_dir")
@@ -53,13 +67,6 @@ pub fn cli() -> clap::Command {
                 .help("The system path (absolute or relative) to the generate output directory"),
         )
         .arg(
-            Arg::new("namespace")
-                .default_value("SpacetimeDB.Types")
-                .long("namespace")
-                .short('n')
-                .help("The namespace that should be used"),
-        )
-        .arg(
             Arg::new("lang")
                 .required(true)
                 .long("lang")
@@ -67,65 +74,24 @@ pub fn cli() -> clap::Command {
                 .value_parser(clap::value_parser!(Language))
                 .help("The language to generate"),
         )
-        .arg(
-            Arg::new("skip_clippy")
-                .long("skip_clippy")
-                .short('s')
-                .short('S')
-                .action(SetTrue)
-                .env("SPACETIME_SKIP_CLIPPY")
-                .value_parser(clap::builder::FalseyValueParser::new())
-                .help("Skips running clippy on the module before generating (intended to speed up local iteration, not recommended for CI)"),
-        )
-        .arg(
-            Arg::new("delete_files")
-                .long("delete-files")
-                .action(SetTrue)
-                .help("Delete outdated generated files whose definitions have been removed from the module. Prompts before deleting unless --force is supplied."),
-        )
-        .arg(
-            Arg::new("force")
-                .long("force")
-                .action(SetTrue)
-                .requires("delete_files")
-                .help("delete-files without prompting first. Useful for scripts."),
-        )
-        .arg(
-            Arg::new("debug")
-                .long("debug")
-                .short('d')
-                .action(SetTrue)
-                .help("Builds the module using debug instead of release (intended to speed up local iteration, not recommended for CI)"),
-        )
         .after_help("Run `spacetime help publish` for more detailed information.")
 }
 
-pub fn exec(_config: Config, args: &clap::ArgMatches) -> anyhow::Result<()> {
-    let project_path = args.get_one::<PathBuf>("project_path").unwrap();
-    let wasm_file = args.get_one::<PathBuf>("wasm_file").cloned();
-    let out_dir = args.get_one::<PathBuf>("out_dir").unwrap();
-    let lang = *args.get_one::<Language>("lang").unwrap();
-    let namespace = args.get_one::<String>("namespace").unwrap();
-    let skip_clippy = args.get_flag("skip_clippy");
-    let build_debug = args.get_flag("debug");
-    let delete_files = args.get_flag("delete_files");
-    let force = args.get_flag("force");
-
-    let wasm_file = if !project_path.is_dir() && project_path.extension().map_or(false, |ext| ext == "wasm") {
-        println!("Note: Using --project-path to provide a wasm file is deprecated, and will be");
-        println!("removed in a future release. Please use --wasm-file instead.");
-        project_path.clone()
-    } else if let Some(path) = wasm_file {
-        println!("Skipping build. Instead we are inspecting {}", path.display());
-        path.clone()
-    } else {
-        crate::tasks::build(project_path, skip_clippy, build_debug)?
-    };
-
-    fs::create_dir_all(out_dir)?;
-
+pub async fn exec(config: Config, args: &clap::ArgMatches) -> anyhow::Result<()> {
+    let out_dir = PathBuf::from(r"C:\Users/MERLI\VSCODE\bitcraft-crafting-wiki\Temp");
+    let lang = Language::TypeScript;
+    let namespace = "SpacetimeDB.Types";
+    println!("Before Parse.");
+    let conn = parse_req(config, args).await?;
+    println!("parse connection.");
+    let api = ClientApi::new(conn);
+    println!("client api");
+    let module = api.module_def().await?;
+    println!("module loaded");
+    fs::create_dir_all(&out_dir)?;
+    let wasm_file = PathBuf::from(r"C:\Users\MERLI\VSCODE\bitcraft-crafting-wiki\Temp");
     let mut paths = vec![];
-    for (fname, code) in generate(&wasm_file, lang, namespace.as_str())? {
+    for (fname, code) in generate(&wasm_file, lang, namespace, module)? {
         let fname = Path::new(&fname);
         // If a generator asks for a file in a subdirectory, create the subdirectory first.
         if let Some(parent) = fname.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -138,53 +104,6 @@ pub fn exec(_config: Config, args: &clap::ArgMatches) -> anyhow::Result<()> {
 
     format_files(paths.clone(), lang)?;
 
-    if delete_files {
-        let mut files_to_delete = vec![];
-        for entry in fs::read_dir(out_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() {
-                if let Ok(contents) = fs::read_to_string(&path) {
-                    if !contents.starts_with("// THIS FILE IS AUTOMATICALLY GENERATED BY SPACETIMEDB.") {
-                        continue;
-                    }
-                }
-
-                if paths
-                    .iter()
-                    .any(|x| x.file_name().unwrap() == path.file_name().unwrap())
-                {
-                    continue;
-                }
-                files_to_delete.push(path);
-            }
-        }
-        if !files_to_delete.is_empty() {
-            let mut input = "y".to_string();
-            println!("The following files were not generated by this command and will be deleted:");
-            for path in &files_to_delete {
-                println!("  {}", path.to_str().unwrap());
-            }
-
-            if !force {
-                print!("Are you sure you want to delete these files? [y/N] ");
-                input = "".to_string();
-                std::io::stdout().flush()?;
-                std::io::stdin().read_line(&mut input)?;
-            } else {
-                println!("Force flag present, deleting files without prompting.");
-            }
-
-            if input.trim().to_lowercase() == "y" || input.trim().to_lowercase() == "yes" {
-                for path in files_to_delete {
-                    fs::remove_file(path)?;
-                }
-                println!("Files deleted successfully.");
-            } else {
-                println!("Files not deleted.");
-            }
-        }
-    }
 
     println!("Generate finished successfully.");
     Ok(())
@@ -217,8 +136,8 @@ pub struct GenCtx {
     names: Vec<Option<String>>,
 }
 
-pub fn generate<'a>(wasm_file: &'a Path, lang: Language, namespace: &'a str) -> anyhow::Result<Vec<(String, String)>> {
-    let module = extract_descriptions(wasm_file)?;
+
+pub fn generate<'a>(wasm_file: &'a Path, lang: Language, namespace: &'a str, module: ModuleDef) -> anyhow::Result<Vec<(String, String)>> {
     let (ctx, items) = extract_from_moduledef(module);
     let items: Vec<GenItem> = items.collect();
     let mut files: Vec<(String, String)> = items
